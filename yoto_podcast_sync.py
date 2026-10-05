@@ -610,6 +610,15 @@ def cmd_sync(args) -> None:
     n_reused = n_adopted = n_uploaded = 0
     claimed_tracks = set()
 
+    def flush_playlist(chapters: list[dict]) -> None:
+        """Write the current chapter list to Yoto (skipped in dry-run)."""
+        if args.dry_run:
+            return
+        content = dict(card.get("content") or {})
+        content["chapters"] = list(chapters)
+        client.update_content(card_id, card["title"], content,
+                              card.get("metadata"))
+
     with tempfile.TemporaryDirectory(prefix="yoto-sync-") as tmp:
         for i, ep in enumerate(window):
             rec = known.get(ep.guid)
@@ -649,6 +658,13 @@ def cmd_sync(args) -> None:
                                              duration, icon_ref))
             if status != "kept":
                 print(f"         -> {status} ({fmt_dur(duration)})")
+            # Incremental save: playlist + state hit disk after every new
+            # episode, so progress is visible live and Ctrl+C loses nothing.
+            if not args.dry_run and status != "kept":
+                save_state(state)
+                flush_playlist(new_chapters)
+                print(f"    playlist saved "
+                      f"({len(new_chapters)}/{len(window)} chapters)")
 
     # Report episodes falling out of the window.
     removed_titles = []
@@ -665,10 +681,8 @@ def cmd_sync(args) -> None:
               "No changes written.")
         return
 
-    print(f"\nWriting playlist ({len(new_chapters)} chapters) ...")
-    content = dict(card.get("content") or {})
-    content["chapters"] = new_chapters
-    client.update_content(card_id, card["title"], content, card.get("metadata"))
+    print(f"\nWriting final playlist ({len(new_chapters)} chapters) ...")
+    flush_playlist(new_chapters)
     save_state(state)
 
     print(f"\nDone: {n_reused} kept, {n_adopted} adopted, {n_uploaded} uploaded"
