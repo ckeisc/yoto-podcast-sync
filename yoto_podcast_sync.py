@@ -120,7 +120,7 @@ class YotoClient:
     # -- token persistence -------------------------------------------------
     def _load_tokens(self) -> None:
         try:
-            data = json.loads(TOKENS_FILE.read_text())
+            data = json.loads(TOKENS_FILE.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
         if data.get("client_id") != self.client_id:
@@ -136,7 +136,7 @@ class YotoClient:
             "access_token": self.access_token,
             "refresh_token": self.refresh_token,
             "expires_at": self.expires_at,
-        }, indent=2))
+        }, indent=2), encoding="utf-8")
 
     @property
     def logged_in(self) -> bool:
@@ -447,14 +447,14 @@ def match_episodes(ordered: list[Episode], wanted: list[str]) -> list[Episode]:
 
 def load_state() -> dict:
     try:
-        return json.loads(STATE_FILE.read_text())
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {"cards": {}}
 
 
 def save_state(state: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------
@@ -702,7 +702,7 @@ def resolve_client_id(args) -> str:
     if env:
         return env
     try:
-        saved = json.loads(TOKENS_FILE.read_text()).get("client_id")
+        saved = json.loads(TOKENS_FILE.read_text(encoding="utf-8")).get("client_id")
     except (OSError, json.JSONDecodeError):
         saved = None
     if saved:
