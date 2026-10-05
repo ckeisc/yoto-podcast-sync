@@ -99,6 +99,17 @@ def fmt_dur(seconds) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
+def norm_channels(ch) -> str | None:
+    """Map a channel count to Yoto's 'stereo'/'mono' enum."""
+    if ch in ("stereo", "mono"):
+        return ch
+    try:
+        n = int(ch)
+    except (TypeError, ValueError):
+        return None
+    return "stereo" if n >= 2 else "mono"
+
+
 # --------------------------------------------------------------------------
 # Yoto API client
 # --------------------------------------------------------------------------
@@ -462,17 +473,37 @@ def save_state(state: dict) -> None:
 # --------------------------------------------------------------------------
 
 def make_chapter(index: int, title: str, track_url: str,
-                 duration, icon_ref: str | None) -> dict:
+                 info: dict | None, icon_ref: str | None) -> dict:
+    """Build a chapter dict.
+
+    `info` carries duration (seconds), file_size (bytes) and channels
+    ('stereo'/'mono') from Yoto's transcode response.
+
+    `format` MUST be 'opus': Yoto transcodes every upload to Opus-in-Ogg,
+    and the Player firmware picks its audio decoder from this field.
+    Declaring the upload format (e.g. 'mp3') makes the Player fail to parse
+    the file and skip through every track in ~0.5s while the server still
+    returns 200.
+    """
+    info = info or {}
+    duration = info.get("duration")
+    track = {
+        "key": "01",
+        "title": title,
+        # overlayLabel is required at track level, not just chapter level
+        "overlayLabel": str(index + 1),
+        "trackUrl": track_url,
+        "type": "audio",
+        "format": "opus",
+        "duration": int(duration) if duration is not None else None,
+        "fileSize": info.get("file_size"),
+        "channels": info.get("channels"),
+    }
+    track = {k: v for k, v in track.items() if v is not None}
     chapter = {
         "key": f"{index:02d}",          # API requires keys <= 20 chars
         "title": title,
-        "tracks": [{
-            "key": "01",
-            "title": title,
-            "trackUrl": track_url,
-            "type": "audio",
-            "duration": duration,
-        }],
+        "tracks": [track],
         "overlayLabel": str(index + 1),
         "availableFrom": None,
         "ambient": None,
@@ -488,11 +519,12 @@ def upload_and_transcode(client: YotoClient, path: Path,
                          filename: str, dry_run: bool = False):
     """Upload an audio file to Yoto and wait for transcoding.
 
-    Returns (track_url like 'yoto:#<sha>', duration_seconds).
+    Returns (track_url like 'yoto:#<sha>', info dict with 'duration'
+    in seconds, 'file_size' in bytes, 'channels' as 'stereo'/'mono').
     With dry_run, returns placeholders without touching the API.
     """
     if dry_run:
-        return "yoto:#dryrun", None
+        return "yoto:#dryrun", {}
     sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
     up = client.get_audio_upload_url(sha256, filename)
     upload_id = up["uploadId"]
@@ -507,8 +539,14 @@ def upload_and_transcode(client: YotoClient, path: Path,
         phase = (tc.get("progress") or {}).get("phase", "")
         tsha = tc.get("transcodedSha256")
         if phase == "complete" or tsha:
-            dur = (tc.get("transcodedInfo") or {}).get("duration")
-            return f"yoto:#{tsha}", dur
+            ti = tc.get("transcodedInfo") or {}
+            dur = ti.get("duration")
+            info = {
+                "duration": int(dur) if dur is not None else None,
+                "file_size": ti.get("fileSize"),
+                "channels": norm_channels(ti.get("channels")),
+            }
+            return f"yoto:#{tsha}", info
         if phase and phase not in ("queued", "analyzing", "processing", "transcoding"):
             raise RuntimeError(f"transcoding failed, phase={phase!r}")
         time.sleep(TRANSCODE_POLL_INTERVAL)
@@ -607,7 +645,7 @@ def cmd_sync(args) -> None:
             card_state["artwork_icon_ref"] = icon_ref
 
     new_chapters: list[dict] = []
-    n_reused = n_adopted = n_uploaded = 0
+    n_reused = n_adopted = n_uploaded = n_repaired = 0
     claimed_tracks = set()
 
     def flush_playlist(chapters: list[dict]) -> None:
@@ -616,48 +654,88 @@ def cmd_sync(args) -> None:
             return
         content = dict(card.get("content") or {})
         content["chapters"] = list(chapters)
-        client.update_content(card_id, card["title"], content,
-                              card.get("metadata"))
+        content.setdefault("activity", "yoto_Player")
+        content.setdefault("version", "1")
+        config = dict(content.get("config") or {})
+        config.setdefault("onlineOnly", False)
+        content["config"] = config
+        # Playlist totals: the Player uses these for scrubbing/seeking.
+        metadata = dict(card.get("metadata") or {})
+        tracks = [ch["tracks"][0] for ch in chapters if ch.get("tracks")]
+        total_dur = sum(t.get("duration") or 0 for t in tracks)
+        total_size = sum(t.get("fileSize") or 0 for t in tracks)
+        media = dict(metadata.get("media") or {})
+        media.update({"duration": total_dur, "fileSize": total_size,
+                      "readableFileSize": round(total_size / 1e6, 1)})
+        metadata["media"] = media
+        client.update_content(card_id, card["title"], content, metadata)
+
+    def store_rec(ep, track_url, info):
+        known[ep.guid] = {
+            "title": ep.title, "track_url": track_url,
+            "duration": info.get("duration"),
+            "file_size": info.get("file_size"),
+            "channels": info.get("channels"),
+            "added": datetime.now(timezone.utc).isoformat()}
+
+    def resolve_via_yoto(ep, i, tmp, why):
+        """Download the episode and resolve its Yoto track info.
+
+        Nothing is re-uploaded: Yoto dedupes by sha256 and hands back the
+        existing transcode (with duration/fileSize/channels) for free.
+        """
+        print(f"[{i + 1}/{len(window)}] {why}  {ep.title}")
+        dest = Path(tmp) / f"ep{i}.mp3"
+        print(f"    downloading ...")
+        download_episode(ep.url, dest)
+        return upload_and_transcode(client, dest, f"{ep.title[:80]}.mp3")
 
     with tempfile.TemporaryDirectory(prefix="yoto-sync-") as tmp:
         for i, ep in enumerate(window):
             rec = known.get(ep.guid)
-            if rec and rec.get("track_url"):
-                track_url, duration = rec["track_url"], rec.get("duration")
+            track_url, info, status = None, None, None
+            if (rec and rec.get("track_url")
+                    and rec.get("file_size") is not None
+                    and rec.get("channels")):
+                track_url = rec["track_url"]
+                info = {"duration": rec.get("duration"),
+                        "file_size": rec.get("file_size"),
+                        "channels": rec.get("channels")}
                 n_reused += 1
                 status = "kept"
             else:
                 hit = existing.get(norm_title(ep.title))
-                if hit and id(hit[1]) not in claimed_tracks:
+                if (hit and id(hit[1]) not in claimed_tracks
+                        and hit[1].get("fileSize") and hit[1].get("channels")):
                     _ch, tr = hit
                     track_url = tr.get("trackUrl")
-                    duration = tr.get("duration")
+                    info = {"duration": tr.get("duration"),
+                            "file_size": tr.get("fileSize"),
+                            "channels": norm_channels(tr.get("channels"))}
                     claimed_tracks.add(id(tr))
-                    known[ep.guid] = {"title": ep.title, "track_url": track_url,
-                                      "duration": duration,
-                                      "added": datetime.now(timezone.utc).isoformat()}
+                    store_rec(ep, track_url, info)
                     n_adopted += 1
                     status = "adopted from playlist"
-                else:
-                    print(f"[{i + 1}/{len(window)}] NEW  {ep.title}")
-                    if not args.dry_run:
-                        dest = Path(tmp) / f"ep{i}.mp3"
-                        print(f"    downloading ...")
-                        download_episode(ep.url, dest)
-                        track_url, duration = upload_and_transcode(
-                            client, dest, f"{ep.title[:80]}.mp3")
-                        known[ep.guid] = {
-                            "title": ep.title, "track_url": track_url,
-                            "duration": duration,
-                            "added": datetime.now(timezone.utc).isoformat()}
+                elif not args.dry_run:
+                    # NEW, or REPAIR: the audio is on Yoto's servers but our
+                    # record/playlist lacks the fields the Player needs.
+                    why = "NEW" if not rec else "REPAIR"
+                    track_url, info = resolve_via_yoto(ep, i, tmp, why)
+                    store_rec(ep, track_url, info)
+                    if why == "NEW":
+                        n_uploaded += 1
                     else:
-                        track_url, duration = "yoto:#dryrun", None
+                        n_repaired += 1
+                    status = "uploaded" if why == "NEW" else "repaired"
+                else:
+                    track_url, info = "yoto:#dryrun", {}
                     n_uploaded += 1
                     status = "uploaded"
             new_chapters.append(make_chapter(i, ep.title, track_url,
-                                             duration, icon_ref))
+                                             info, icon_ref))
             if status != "kept":
-                print(f"         -> {status} ({fmt_dur(duration)})")
+                print(f"         -> {status} "
+                      f"({fmt_dur((info or {}).get('duration'))})")
             # Incremental save: playlist + state hit disk after every new
             # episode, so progress is visible live and Ctrl+C loses nothing.
             if not args.dry_run and status != "kept":
@@ -686,6 +764,7 @@ def cmd_sync(args) -> None:
     save_state(state)
 
     print(f"\nDone: {n_reused} kept, {n_adopted} adopted, {n_uploaded} uploaded"
+          + (f", {n_repaired} repaired" if n_repaired else "")
           + (f", {len(removed_titles)} dropped (outside --max-episodes window)"
              if removed_titles else ""))
     print(f"Playlist '{card['title']}' ({card_id}) now mirrors the feed.")

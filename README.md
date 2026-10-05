@@ -94,5 +94,14 @@ python yoto_podcast_sync.py sync "<url>" --episode-list popular.txt --title "水
   nothing — just re-run and it picks up where it left off.
 - **Window slides.** When new episodes push old ones past `--max-episodes`,
   the oldest chapters are dropped so the playlist mirrors the feed.
+- **Player needs `format: "opus"`.** Yoto transcodes every upload to Opus-in-Ogg
+  and the Player firmware picks its audio decoder from the track's `format`
+  field — the server accepts the playlist (HTTP 200) even when it's wrong,
+  but the Player then skips through every track in a fraction of a second.
+  The script always declares `format: "opus"` plus track-level
+  `overlayLabel`, `fileSize`, `channels`, and playlist `metadata.media`
+  totals. If a playlist was built by an older version without these, just
+  re-run sync: episodes are re-resolved through Yoto's sha256 dedup (no
+  re-upload, no re-transcode) and the playlist is rewritten correctly.
 - **Link a card.** After syncing, open the Yoto app, find the playlist, and
   "Link to a card" — then it plays on the Yoto player.
