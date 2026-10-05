@@ -395,6 +395,12 @@ def download_episode(url: str, dest: Path) -> str:
     return h.hexdigest()
 
 
+def canon_epnum(s: str) -> str:
+    """Canonicalize an episode number: EP08 -> EP8, ep136 -> EP136."""
+    m = re.search(r"EP0*(\d+)", s, re.I)
+    return f"EP{m.group(1)}" if m else s.upper()
+
+
 def match_episodes(ordered: list[Episode], wanted: list[str]) -> list[Episode]:
     """Match a hand-picked list (EP numbers, titles, or YouTube titles)
     against feed episodes, preserving the list's order (most popular first).
@@ -407,7 +413,7 @@ def match_episodes(ordered: list[Episode], wanted: list[str]) -> list[Episode]:
     for e in ordered:
         m = re.match(r"(EP\d+)", e.title, re.I)
         if m:
-            by_epnum.setdefault(m.group(1).upper(), e)
+            by_epnum.setdefault(canon_epnum(m.group(1)), e)
         by_title[norm_title(e.title)] = e
 
     result: list[Episode] = []
@@ -415,7 +421,7 @@ def match_episodes(ordered: list[Episode], wanted: list[str]) -> list[Episode]:
         ep = None
         m = re.search(r"EP\d+", w, re.I)
         if m:
-            ep = by_epnum.get(m.group(0).upper())
+            ep = by_epnum.get(canon_epnum(m.group(0)))
         if ep is None:
             ep = by_title.get(norm_title(w))
         if ep is None:
