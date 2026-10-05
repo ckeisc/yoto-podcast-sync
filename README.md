@@ -89,7 +89,9 @@ python yoto_podcast_sync.py sync "<url>" --episode-list popular.txt --title "水
   `~/.yoto-podcast-sync/state.json`; tokens in `~/.yoto-podcast-sync/tokens.json`.
 - **First run takes a while.** A 374-episode feed syncs the newest 100;
   each MP3 is downloaded, uploaded to Yoto, and transcoded before it lands
-  in the playlist (~15 MB per episode for the tested feed).
+  in the playlist (~15 MB per episode for the tested feed). The playlist is
+  saved after every episode, so progress shows up live and Ctrl+C loses
+  nothing — just re-run and it picks up where it left off.
 - **Window slides.** When new episodes push old ones past `--max-episodes`,
   the oldest chapters are dropped so the playlist mirrors the feed.
 - **Link a card.** After syncing, open the Yoto app, find the playlist, and
