@@ -248,25 +248,51 @@ class YotoClient:
         self._store_token_response(tokens)
 
     # -- API calls -----------------------------------------------------------
+    def _refresh_if_expired(self) -> None:
+        """Refresh proactively when the access token has expired.
+
+        Yoto answers expired tokens with 403 rather than 401, which a
+        401-only retry never catches — hence the proactive check.
+        """
+        if self.refresh_token and time.time() >= (self.expires_at or 0):
+            try:
+                self.refresh()
+            except YotoAuthError as e:
+                raise YotoAuthError(
+                    f"Session expired and refresh failed ({e}). "
+                    "Run `login` again.") from e
+
     def _api(self, method: str, path: str, **kw) -> dict:
         if not self.access_token:
             raise YotoAuthError("Not logged in. Run `login` first.")
+        self._refresh_if_expired()
         headers = kw.pop("headers", {})
         headers["Authorization"] = f"Bearer {self.access_token}"
         if "json" in kw:
             headers["Content-Type"] = "application/json"
         r = requests.request(method, f"{API_BASE}{path}",
                              headers=headers, timeout=60, **kw)
-        if r.status_code == 401 and self.refresh_token:
-            self.refresh()
-            headers["Authorization"] = f"Bearer {self.access_token}"
-            r = requests.request(method, f"{API_BASE}{path}",
-                                 headers=headers, timeout=60, **kw)
+        if r.status_code in (401, 403) and self.refresh_token:
+            # Yoto sometimes answers 403 (not 401) for an expired token,
+            # so one refresh+retry is worth trying before giving up.
+            try:
+                self.refresh()
+            except YotoAuthError:
+                pass
+            else:
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                r = requests.request(method, f"{API_BASE}{path}",
+                                     headers=headers, timeout=60, **kw)
         if not r.ok:
             try:
                 msg = r.json().get("error", {}).get("message")
             except ValueError:
                 msg = None
+            if r.status_code == 403 and not msg:
+                msg = ("HTTP 403: this token is not allowed to "
+                       f"{method} {path}. Check the enabled scopes for your "
+                       "client at dashboard.yoto.dev, then delete "
+                       "tokens.json and run `login` again.")
             raise RuntimeError(msg or f"Yoto API {method} {path}: HTTP {r.status_code}")
         return r.json()
 
